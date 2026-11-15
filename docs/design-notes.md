@@ -50,7 +50,11 @@ Format: what I observed, then what the parser has to do about it.
 1. 10-K - Annual Financial Report
 2. 10-Q - Quarterly Financial Report
 3. 10-K/A, 10-Q/A - Corrections to earlier 10-K/10-Q
-4. 10-KT, 10-QT -  Transitional Reports When Company Changes Fiscal Year End
+4. 10-KT, 10-QT - Transitional Reports When Company Changes Fiscal Year End
+
+Out of scope for now: DEF 14A (proxy statements), registration statements (S-1, S-4, 424B),
+ownership forms (3, 4, 5, 144, 13G), and foreign filers (20-F, 40-F, 6-K, which often use IFRS).
+8-K Item 2.02 (earnings releases) is noted for later as the earliest public date of results.
 
 **`recent` is not the full history.** It holds the latest ~1,000 filings. Older ones are in extra
 files listed under `filings.files` (Nike has two, going back to 1995). 24 of the 70 filings that
@@ -62,10 +66,12 @@ reported net income are not in `recent`.
 **Facts are already linked to filings.** Every fact carries `accn` (accession number) and `filed`
 (filing date), plus copies of `form`, `fy`, `fp`. `accn` joins to `accessionNumber` in
 `submissions` and also builds the filing's folder URL.
-→ Store `accn` and `filed` on every fact row. They make the data traceable to the actual filing.
+→ Store `accn` and `filed` on every fact row. `accn` makes the data traceable to the actual
+filing; `filed` enables point-in-time queries (only using facts that were public on a given date,
+which avoids look-ahead bias).
 
 **`companyfacts` gives all facts at once, but not everything.** One request returns every fact
-from every filing, so no per-filing parsing is needed for core numbers. However, `companyfacts` exclude
+from every filing, so no per-filing parsing is needed for core numbers. However, `companyfacts` excludes
 some information such as segments, geographies, and footnotes. Furthermore, `companyfacts` only covers
 2009+ filings.
 → Parser needs two components: a facts normalizer over `companyfacts` (phase 1) and a filing parser for
@@ -75,15 +81,21 @@ segments, text, and older data (phase 2).
 
 **The same period is reported many times.** `NetIncomeLoss` has 236 entries but only ~110 unique
 periods, because each 10-K and 10-Q repeats prior-period comparatives.
-→ Need a rule for choosing one value per period to push as a response to a query. 
+→ Store every entry; don't deduplicate at ingestion. Choosing a single value per period happens
+at query time (see below).
 
 **Repeated values are not always identical.** Some periods have different values across filings,
-e.g. FY2009 net income is 1,486.7M in one filing and 1,487M in a later one. Counts of periods with
-more than one value: net income several, operating cash flow 17, `SalesRevenueNet` 12, assets 4.
-Many look like rounding/precision changes. However, some may be real restatements or reclassifications.
-→ Keep every reported value with its `filed` date rather than overwriting. Decide whether "as of"
-queries return the first-reported or latest-known value. Distinguish rounding from restatement
-(compare relative difference).
+e.g. FY2009 net income is 1,486.7M in one filing and 1,487M in a later one. Periods with more than
+one value: operating cash flow 17, `SalesRevenueNet` 12, assets 4. Many look like rounding/precision
+changes. However, some may be real restatements or reclassifications.
+→ Keep every reported value with its `filed` date rather than overwriting. Selection rule at query
+time: filter to facts with `filed <= as_of`, then take the most recently filed value for the
+period ("latest known as of X"). Optionally support "first reported" too. Flag differences above
+a small relative threshold as possible restatements rather than rounding.
+
+**Storage vs. query.** Storage keeps everything; the query layer picks one value per period based
+on the `as_of` date. That way the same data answers both "what's the best number today?" and
+"what was known on date X?"
 
 ### Concepts and tags
 
