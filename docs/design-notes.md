@@ -159,3 +159,161 @@ have it, and it can land on a DEF 14A entry rather than the 10-K for the same pe
 - Include 10-K/A and 10-Q/A amendments, and how do they override the originals?
 - What to do with odd-duration facts (e.g. 12-month values in a 10-Q)?
 - How to handle companies whose fiscal year end changes?
+- Should point-in-time logic eventually use the 8-K earnings release date (Item 2.02) instead of
+  the 10-K/10-Q filing date, since the market learns the numbers weeks earlier?
+
+## Roadmap
+
+Each phase leaves the repo in a working, showable state.
+
+1. **Core numbers.** Fetcher + `companyfacts`. ~5 canonical fields (revenue, net income,
+   operating cash flow, capex, shares outstanding). Annual 10-K data, a handful of companies.
+   Storage keeps every version; `as_of` queries.
+2. **Complicated numbers.** Still `companyfacts`: quarterly data (YTD subtraction, derived Q4,
+   TTM), restatements and amendments, fiscal vs. calendar alignment, ~25 fields (debt, cash, ...),
+   more companies including odd ones (banks, unusual fiscal years). Validation suite and coverage
+   stats.
+3. **First valuation (MVP).** Derived metrics (FCF, margins, growth, net debt, per-share values),
+   a simple DCF and peer multiples, a market price source. Output: fair value vs. market price.
+4. **Footnotes and filing parsing.** Inline XBRL and `FilingSummary.xml`. Numbers `companyfacts`
+   lacks (segments, geographies, dimensional footnote details). Text: footnote TextBlocks and
+   10-K sections (1A, 7), stored at sentence/paragraph level with section labels. Use footnote
+   data to improve valuation (leases, stock comp, debt schedule, segments).
+5. **Text intelligence.** LLM layer, text signals, and point-in-time backtests of the full pricer.
+
+## How the data will be used
+
+```
+                ┌─ numbers (companyfacts) ─→ derived metrics ─→ DCF / comps ─┐
+filings ─ parser┤                                                             ├→ fair value + signals + explanation
+                └─ text (footnotes, 1A, MD&A) ─→ adjustments, flags, NLP features, citations ┘
+```
+
+**Numbers → valuation.** Derived metrics: margins, growth, free cash flow (operating cash flow −
+capex), net debt (debt − cash), per-share values, TTM figures. Two valuation methods:
+
+- **DCF:** project FCF, discount at cost of capital, add terminal value, subtract net debt, divide
+  by shares.
+- **Comps:** peer multiples (P/E, EV/EBITDA, EV/Sales, P/FCF) applied to the company's numbers.
+  Peers by SIC code, size, or business-description similarity.
+
+What the valuation needs from the parser: operating cash flow and capex, debt and cash, shares
+outstanding with its own date, standalone quarters for TTM, calendar-aligned periods for comps,
+SIC codes, and `as_of` queries for backtests. Market prices come from a separate source.
+
+**Text → adjustments, signals, explanations.** Footnotes explain why numbers moved, how they
+were measured, and what isn't on the statements yet. Facts and text share `accn` + `filed` as
+the common key. Text table sketch: `(accn, filed, section_or_note, tag, text, offsets)`.
+
+## Feature ideas (Phases 4–5)
+
+### Hard numbers from footnotes (Phase 4, feed the pricer directly)
+
+Check `companyfacts` first; some of these are already tagged (lease liabilities, remaining
+performance obligations, unrecognized tax benefits).
+
+| Value | Footnote | Why it matters |
+|---|---|---|
+| Debt maturity schedule | Debt | Refinancing risk |
+| Average interest rate on debt | Debt | Cost of debt → discount rate |
+| Lease obligations | Leases | Debt-like; add to net debt |
+| Purchase commitments | Commitments | Locked-in future outflows |
+| Litigation accruals, possible loss ranges | Contingencies | Potential future costs |
+| Stock-based comp, unvested awards | Stock comp | True cost of pay; future dilution |
+| Effective tax rate, unrecognized tax benefits | Income taxes | Forecast tax rate; tax risk |
+| Pension funded status | Pensions | Hidden debt |
+| Remaining performance obligations / backlog | Revenue | Contracted future revenue |
+| Customer concentration | Segments / concentrations | Dependence risk |
+| Segment revenue and margins, geographic mix | Segments | Per-segment forecasts; currency exposure |
+| Goodwill, impairments | Goodwill | Overpaid acquisitions; write-down risk |
+| Inventory breakdown | Inventories | Demand signals |
+
+### LLM layer (Phase 5)
+
+A pipeline component that sends clean text to an LLM for a specific job and stores the result
+with the filing's `accn` and `filed` date. Jobs:
+
+1. **Extraction:** prose → structured rows (e.g. "issued $1.0B of 4.25% notes due 2033" →
+   debt table row).
+2. **Summarization / change detection:** e.g. what changed in Risk Factors since last year.
+3. **Classification / flags:** policy change, material lawsuit, going-concern doubt.
+4. **Q&A and explanation (RAG):** answer questions about a valuation using retrieved footnote
+   chunks, citing each claim to a note in a filing.
+
+Trust rules: validate against XBRL where they overlap and report accuracy; require citations
+(`accn` + note + offsets); run once per filing and store outputs (repeatable, cheap,
+point-in-time); never use the LLM for numbers XBRL already has.
+
+### Embedding-based scoring (Phase 5)
+
+Original idea: embed sentences and compare (cosine similarity) to an anchor like "high risk".
+
+Problems with the naive version: embeddings capture topic more than tone (every risk-factor
+sentence is "about risk"); cosine scores bunch in a narrow positive range with no natural zero;
+negation ("we do not expect material losses"); a single short anchor is noisy; boilerplate
+dominates.
+
+Better versions:
+
+- **Two-pole axis:** sets of high-risk and low-risk anchor sentences; score by projection onto the
+  difference of their averages. Gives a signed score with a meaningful zero.
+- **Supervised classifier:** label a few hundred to a few thousand sentences (by hand or with an
+  LLM, spot-checked) and train a classifier on the embeddings.
+- **Changes over levels:** compare each filing with the company's previous one (*Lazy Prices*,
+  Cohen, Malloy & Nguyen).
+- **Baselines:** Loughran–McDonald word lists, FinBERT.
+
+Embeddings vs. LLM rating: they overlap on scoring. LLMs handle nuance and negation better;
+embeddings are cheaper, faster, deterministic, and also do similarity jobs (retrieval, year-over-year
+comparison, peer finding). Combined pattern: LLM labels a sample → spot-check → train an
+embedding classifier → run it cheaply on all filings.
+
+### Model choice by label type
+
+| Labels | Model |
+|---|---|
+| Binary (0/1) | Logistic regression |
+| Unordered categories | Multinomial (softmax) logistic regression |
+| Multiple topics per sentence | Multi-label: one binary classifier per label |
+| Ordered ratings (e.g. risk 1–5) | Ordinal logistic regression (`statsmodels` `OrderedModel`, `mord`); or collapse to binary; or ridge regression |
+| Continuous values | Ridge regression; fractional logit for values in [0, 1] |
+
+Evaluate ordered labels with Spearman rank correlation; rare events with precision/recall, not
+accuracy.
+
+### Categories to score
+
+**Tone (ordinal/binary):** risk severity, sentiment, uncertainty, confidence (weak vs. strong
+modal words), forward-looking optimism, specificity (boilerplate ↔ concrete).
+
+**Topics (multi-label):** liquidity and debt, litigation, regulation, supply chain and inventory,
+competition, macro (rates, inflation, currency), geopolitics and regions, cybersecurity, labor
+and management, technology / AI, climate and ESG. Aggregated per filing → topic exposure profile.
+
+**Events / red flags (binary, rare):** accounting policy change, restatement, going-concern doubt,
+material weakness in internal controls, impairment, major lawsuit or investigation, covenant
+breach or waiver, executive or auditor departure, customer loss.
+
+**Statement type:** forward-looking vs. historical; boilerplate vs. company-specific (use as a
+filter before other scores); quantitative vs. qualitative (flags candidates for extraction).
+
+**Outcome-based labels (quant):** label text by what happened next (high vs. low next-year
+volatility, out- vs. underperformance). Strongest signal if it works, easiest to fool yourself;
+needs strict time-based train/test splits.
+
+### Structural features
+
+Year-over-year section similarity, new footnotes or risk factors added, length growth, count of
+accounting policy changes, critical audit matters (count, topics), filing timing (days after
+period end, late-filing notices), number of restatements or amendments. Readability (e.g. Fog
+index): Feng Li found harder-to-read annual reports go with weaker, less persistent earnings.
+
+### Validation plan
+
+Test whether per-filing scores, and their year-over-year changes, predict something measurable
+after the filing date: next-year volatility (cleaner) or returns (harder). Point-in-time inputs
+only. Compare: embedding anchors vs. LLM ratings vs. embedding classifier on LLM labels vs.
+Loughran–McDonald vs. FinBERT vs. no text. Report results honestly, including negative ones.
+
+Suggested first set: boilerplate vs. specific (filter), risk severity, uncertainty, and two or
+three topic labels.
